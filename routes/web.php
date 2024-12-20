@@ -11,11 +11,17 @@ Route::get('/Attendance',[Display::class,'Display'])->name('admin.attendance');
 Route::get('/AttendanceDash',[Display::class,'Display1'])->name('admin.attendanceDash');
 Route::get('/AttendanceRecords', [Display::class, 'AttendanceRecords'])->name('admin.attendanceRecords');
 Route::get('/admindash',[Display::class,'Display3'])->name('admin.dashboard');
+
+Route::get('/dashboard-data', [Display::class, 'getDashboardData']);
+
+
 Route::get('/position',[Display::class,'Display4'])->name('admin.position');
 Route::get('/payroll',[Display::class,'Display8'])->name('admin.payroll');
 Route::get('/deduction',[Display::class,'Display9'])->name('admin.deduction');
 Route::get('/cashadvance',[Display::class,'Display10'])->name('admin.cashadvance');
 Route::get('/',[Display::class,'Display11'])->name('admin.login');
+Route::post('/payroll/save-all', [Display::class, 'saveAll'])->name('payroll.saveAll');
+Route::get('/payroll/history/{employee_id}', [Display::class, 'viewEmployeeHistory'])->name('payroll.history');
 
 Route::delete('/deduction/{id}', [Display::class, 'deleteDeduction'])->name('deduction.delete');
 Route::delete('/position/{id}', [Display::class, 'deletePosition']);
@@ -32,10 +38,9 @@ Route::post('/holiday', [Display::class, 'addHoliday'])->name('admin.addHoliday'
 Route::put('/holiday/{holiday_id}', [Display::class, 'updateHoliday'])->name('holiday.update');
 Route::delete('/holiday/{holiday_id}', [Display::class, 'deleteHoliday'])->name('holiday.delete');
 
-Route::get('/payroll/calculate/{employee_id}', [Display::class, 'fetchPayrollData']);
-Route::get('/payroll/display8', [Display::class, 'Display8'])->name('payroll.display8');
-Route::post('/payroll/update/{id}', [Display::class, 'updatePayroll'])->name('payroll.update');
 
+
+Route::get('/report/{id}', [Display::class, 'generateReport'])->name('admin.attendance.report');
 
 
 

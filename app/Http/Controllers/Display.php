@@ -41,26 +41,23 @@ class Display extends Controller
     }
     public function Display8()
     {
+        $currentDate = Carbon::now();
+    
+        // Determine payroll period (1st-15th or 16th-end of month)
+        $startDate = $currentDate->day <= 15
+            ? $currentDate->copy()->startOfMonth()
+            : $currentDate->copy()->startOfMonth()->addDays(15);
+    
+        $endDate = $currentDate->day <= 15
+            ? $startDate->copy()->addDays(14)
+            : $startDate->copy()->endOfMonth();
+    
+        // Current Payroll
         $employees = Employee::with(['position', 'deduction'])
             ->get()
-            ->map(function ($employee) {
-                // Fetch the detailed payroll breakdown
-                $payroll = $this->calculatePayroll($employee->employee_id) ?? [
-                    'regular_pay' => 0,
-                    'overtime_pay' => 0,
-                    'holiday_pay' => 0,
-                    'extra_2to4_pay' => 0, // 2-4 AM Pay
-                    'gross_salary' => 0,
-                    'cash_advance' => 0,
-                    'net_salary' => 0,
-                ];
-    
-                // Deduction details
-                $deductionAmount = $employee->deduction->amount ?? 0;
-                $deductionName = $employee->deduction->name ?? 'None';
-    
-                // Total deductions: includes deduction and cash advance
-                $totalDeductions = $deductionAmount + ($payroll['cash_advance'] ?? 0);
+            ->map(function ($employee) use ($startDate, $endDate) {
+                // Automatically save payroll data and fetch the breakdown
+                $payroll = $this->calculatePayroll($employee->employee_id, true, $startDate, $endDate);
     
                 return [
                     'employee_id'       => $employee->employee_id,
@@ -69,21 +66,60 @@ class Display extends Controller
                     'regular_pay'       => round($payroll['regular_pay'], 2),
                     'overtime_pay'      => round($payroll['overtime_pay'], 2),
                     'holiday_pay'       => round($payroll['holiday_pay'], 2),
-                    'extra_2to4_pay'    => round($payroll['extra_2to4_pay'], 2), // Ensure this is included
+                    'extra_2to4_pay'    => round($payroll['extra_2to4_pay'], 2),
                     'gross_salary'      => round($payroll['gross_salary'], 2),
                     'cash_advance'      => round($payroll['cash_advance'], 2),
-                    'deduction_name'    => $deductionName,
-                    'deductions'        => round($deductionAmount, 2),
-                    'total_deductions'  => round($totalDeductions, 2),
+                    'deduction_name'    => $employee->deduction->name ?? 'None',
+                    'deductions'        => round($payroll['deductions'], 2),
+                    'total_deductions'  => round($payroll['deductions'] + $payroll['cash_advance'], 2),
                     'net_salary'        => round($payroll['net_salary'], 2),
+                    'start_date'        => $startDate->toDateString(),
+                    'end_date'          => $endDate->toDateString(),
                 ];
             });
     
-        // Log data for debugging 2-4 AM Pay
-        logger("Payroll Data with 2-4 AM Pay: ", $employees->toArray());
+        // Payroll History
+        $payrollHistory = Payroll::with('employee')
+            ->orderBy('start_date', 'desc')
+            ->get()
+            ->map(function ($payroll) {
+                return [
+                    'employee_id'       => $payroll->employee_id,
+                    'name'              => $payroll->employee->first_name . ' ' . $payroll->employee->last_name,
+                    'position_name'     => $payroll->employee->position->position_name ?? 'N/A',
+                    'regular_pay'       => round($payroll->regular_pay, 2),
+                    'overtime_pay'      => round($payroll->overtime_pay, 2),
+                    'holiday_pay'       => round($payroll->holiday_pay, 2),
+                    'extra_2to4_pay'    => round($payroll->extra_2to4_pay, 2),
+                    'gross_salary'      => round($payroll->gross_salary, 2),
+                    'cash_advance'      => round($payroll->cash_advance, 2),
+                    'deductions'        => round($payroll->deductions, 2),
+                    'net_salary'        => round($payroll->net_salary, 2),
+                    'start_date'        => $payroll->start_date,
+                    'end_date'          => $payroll->end_date,
+                ];
+            });
     
-        return view('payroll', ['employees' => $employees]);
+        return view('payroll', ['employees' => $employees, 'payrollHistory' => $payrollHistory]);
     }
+    public function viewEmployeeHistory($employee_id)
+{
+    $employee = Employee::findOrFail($employee_id);
+
+    // Fetch payroll history for the specific employee
+    $payrollHistory = Payroll::where('employee_id', $employee_id)
+        ->orderBy('start_date', 'desc')
+        ->get();
+
+    return response()->json([
+        'employee' => [
+            'name' => $employee->first_name . ' ' . $employee->last_name,
+            'position' => $employee->position->position_name ?? 'N/A',
+        ],
+        'payrolls' => $payrollHistory,
+    ]);
+}
+
     
     
     public function Display7()
@@ -173,65 +209,74 @@ class Display extends Controller
         return view('position', compact('position'));
     }
 
-    public function Display3()
-{
-    // Total Employees
-    $totalEmployees = Employee::count();
-
-    // Today's Date
-    $today = now()->toDateString();
-
-    // Fetch today's attendance with schedules
-    $attendancesToday = Attendance::with('employee.schedule')
-        ->whereDate('check_in_time', $today)
-        ->whereNotNull('check_in_time')
-        ->get();
-
-    // On-Time and Late Today
-    $onTimeToday = 0;
-    $lateToday = 0;
-
-    foreach ($attendancesToday as $attendance) {
-        $schedule = optional($attendance->employee->schedule);
-
-        if ($schedule) {
-            $scheduledCheckIn = Carbon::parse($schedule->check_in_time); // Scheduled check-in
-            $actualCheckIn = Carbon::parse($attendance->check_in_time); // Actual attendance time
-
-            // Check if on time or late
-            if ($actualCheckIn->lte($scheduledCheckIn)) {
-                $onTimeToday++;
-            } else {
-                $lateToday++;
+    public function Display3(Request $request)
+    {
+        // Total Employees
+        $totalEmployees = Employee::count();
+    
+        // Today's Date
+        $today = now()->toDateString();
+    
+        // Handle selected month and year from the request
+        $selectedMonth = $request->input('month', now()->month); // Defaults to current month if not selected
+        $selectedYear = now()->year; // Defaults to current year
+    
+        // Fetch today's attendance with schedules
+        $attendancesToday = Attendance::with('employee.schedule')
+            ->whereDate('check_in_time', $today)
+            ->whereNotNull('check_in_time')
+            ->get();
+    
+        // On-Time and Late Today
+        $onTimeToday = 0;
+        $lateToday = 0;
+    
+        foreach ($attendancesToday as $attendance) {
+            $schedule = optional($attendance->employee->schedule);
+    
+            if ($schedule && $attendance->check_in_time) {
+                $scheduledCheckIn = Carbon::parse($schedule->check_in_time)->setTimezone('Asia/Manila');
+                $actualCheckIn = Carbon::parse($attendance->check_in_time)->setTimezone('Asia/Manila');
+    
+                if ($actualCheckIn->lte($scheduledCheckIn)) {
+                    $onTimeToday++;
+                } else {
+                    $lateToday++;
+                }
             }
         }
-    }
-
-    // Calculate On-Time Percentage
-    $totalAttendanceToday = $onTimeToday + $lateToday;
-    $onTimePercentage = $totalAttendanceToday > 0
-        ? ($onTimeToday / $totalAttendanceToday) * 100
-        : 0;
-
-    // Monthly Attendance Report
-    $attendanceCountsCurrentMonth = Attendance::with('employee.schedule')
-        ->whereMonth('check_in_time', now()->month)
-        ->whereNotNull('check_in_time')
-        ->get()
-        ->groupBy(function ($attendance) {
-            return date('j', strtotime($attendance->check_in_time)); // Group by day of the month
-        })
-        ->map(function ($dayAttendances) {
+    
+        // Fetch attendance for the selected month
+        $monthlyAttendance = Attendance::with('employee.schedule')
+            ->whereYear('check_in_time', $selectedYear)
+            ->whereMonth('check_in_time', $selectedMonth)
+            ->whereNotNull('check_in_time')
+            ->get();
+    
+        // Group Monthly Attendance by Day
+        $daysInMonth = Carbon::createFromDate($selectedYear, $selectedMonth)->daysInMonth;
+        $monthlyAttendanceGrouped = $monthlyAttendance->groupBy(function ($attendance) {
+            return Carbon::parse($attendance->check_in_time)->day; // Group by day
+        });
+    
+        // Initialize counters for on-time and late
+        $onTimeSelectedMonth = 0;
+        $lateSelectedMonth = 0;
+    
+        // Calculate daily on-time and late counts
+        $attendanceCountsSelectedMonth = collect(range(1, $daysInMonth))->mapWithKeys(function ($day) use ($monthlyAttendanceGrouped) {
+            $dailyAttendance = $monthlyAttendanceGrouped->get($day, collect());
+    
             $ontime = 0;
             $late = 0;
-
-            foreach ($dayAttendances as $attendance) {
+    
+            foreach ($dailyAttendance as $attendance) {
                 $schedule = optional($attendance->employee->schedule);
-
-                if ($schedule) {
-                    $scheduledCheckIn = Carbon::parse($schedule->check_in_time);
-                    $actualCheckIn = Carbon::parse($attendance->check_in_time);
-
+    
+                if ($schedule && $attendance->check_in_time) {
+                    $scheduledCheckIn = Carbon::parse($schedule->check_in_time)->setTimezone('Asia/Manila');
+                    $actualCheckIn = Carbon::parse($attendance->check_in_time)->setTimezone('Asia/Manila');
+    
                     if ($actualCheckIn->lte($scheduledCheckIn)) {
                         $ontime++;
                     } else {
@@ -239,32 +284,56 @@ class Display extends Controller
                     }
                 }
             }
-
-            return [
-                'ontime' => $ontime,
-                'late' => $late,
-            ];
-        })
-        ->sortKeys();
-
-    // Prepare chart data
-    $attendanceCountsCurrentMonth = $attendanceCountsCurrentMonth->map(function ($data, $day) {
-        return [
-            'day' => $day,
-            'ontime' => $data['ontime'],
-            'late' => $data['late'],
-        ];
-    })->values();
-
-    return view('admindash', compact(
-        'totalEmployees',
-        'onTimePercentage',
-        'onTimeToday',
-        'lateToday',
-        'attendanceCountsCurrentMonth'
-    ));
+    
+            return [$day => ['ontime' => $ontime, 'late' => $late]];
+        })->sortKeys();
+    
+        // Calculate totals for the selected month
+        $onTimeSelectedMonth = $attendanceCountsSelectedMonth->sum('ontime');
+        $lateSelectedMonth = $attendanceCountsSelectedMonth->sum('late');
+    
+        // Calculate on-time percentage
+        $onTimePercentage = ($onTimeSelectedMonth + $lateSelectedMonth) > 0
+            ? ($onTimeSelectedMonth / ($onTimeSelectedMonth + $lateSelectedMonth)) * 100
+            : 0;
+    
+            // Check if the selected month has any attendance data
+    if ($monthlyAttendance->isEmpty()) {
+        // Set KPI values to 0 if there is no attendance data
+        $onTimeToday = 0;
+        $lateToday = 0;
+        $onTimePercentage = 0;
+        $attendanceCountsSelectedMonth = collect(range(1, $daysInMonth))->mapWithKeys(function ($day) {
+            return [$day => ['ontime' => 0, 'late' => 0]];
+        });
+    } else {
+    // Existing logic to calculate KPIs if attendance exists
+    // (This part of the code remains as is)
 }
 
+    
+        // Prepare chart data for Blade view
+        $attendanceCountsSelectedMonth = $attendanceCountsSelectedMonth->map(function ($data, $day) {
+            return [
+                'day' => $day,
+                'ontime' => $data['ontime'] ?? 0,
+                'late' => $data['late'] ?? 0,
+            ];
+        })->values();
+    
+        // Pass the data to the view
+        return view('admindash', compact(
+            'totalEmployees',
+            'onTimeToday',
+            'lateToday',
+            'attendanceCountsSelectedMonth',
+            'selectedMonth',
+            'onTimePercentage'
+        ));
+    }
+    
+  
+    
     public function Display10()
     {
         // Fetching cash advances with employee details using Eloquent relationship
@@ -344,14 +413,122 @@ public function destroy($id)
     }
     
     
-    
-
-    public function Display1()
+    public function Display1($month = null)
     {
-        $attendances = Attendance::all();
-        return view('attendanceDash', compact('attendances'));
+        $month = $month ?: Carbon::now()->month; // Default to current month if not provided
+        $startDate = Carbon::now()->month($month)->startOfMonth(); // Start of the selected month
+        $endDate = Carbon::now()->startOfDay()->addDay(); // Current date plus one day
+        $employees = Employee::all();
+    
+        $attendanceData = [];
+        $attendances = Attendance::with('employee')
+            ->whereBetween('check_in_time', [$startDate, $endDate])
+            ->get()
+            ->map(function ($attendance) {
+                if ($attendance->check_out_time) {
+                    $hoursWorked = Carbon::parse($attendance->check_in_time)
+                        ->diffInHours(Carbon::parse($attendance->check_out_time));
+                    $attendance->overtime_hours = $hoursWorked > 8 ? $hoursWorked - 8 : 0;
+                } else {
+                    $attendance->overtime_hours = 0;
+                }
+                return $attendance;
+            });
+    
+        foreach ($employees as $employee) {
+            $workingDays = [];
+            $saturdaysCount = 0;
+    
+            for ($date = $startDate->copy(); $date <= $endDate; $date->addDay()) {
+                if (!$date->isSunday()) { // Include Saturdays but exclude Sundays
+                    $workingDays[] = $date->toDateString();
+                }
+                if ($date->isSaturday()) {
+                    $saturdaysCount++;
+                }
+            }
+    
+            $presentDays = Attendance::where('employee_id', $employee->id)
+                ->whereBetween('check_in_time', [$startDate, $endDate])
+                ->pluck('check_in_time')
+                ->map(fn($date) => Carbon::parse($date)->toDateString())
+                ->toArray();
+    
+            $absentDays = array_diff($workingDays, $presentDays);
+    
+            $attendanceData[] = [
+                'employee' => $employee,
+                'total_present' => count($presentDays),
+                'total_absent' => count($absentDays),
+                'absent_days' => $absentDays,
+                'saturdays_count' => $saturdaysCount,
+            ];
+        }
+    
+        return view('attendanceDash', compact('attendances', 'attendanceData', 'month'));
     }
 
+    public function generateReport($id, $month = null)
+    {
+        try {
+            $month = $month ?: Carbon::now()->month; // Default to current month if not provided
+            $startDate = Carbon::now()->month($month)->startOfMonth();
+            $endDate = Carbon::now()->startOfDay()->addDay(); // End date is the current day plus one
+    
+            $attendanceRecords = Attendance::where('employee_id', $id)
+                ->whereBetween('check_in_time', [$startDate, $endDate])
+                ->get();
+    
+            $presentDays = $attendanceRecords->pluck('check_in_time')
+                ->map(fn($date) => Carbon::parse($date)->toDateString())
+                ->toArray();
+    
+            $workingDays = [];
+            $saturdaysCount = 0;
+    
+            for ($date = $startDate->copy(); $date <= $endDate; $date->addDay()) {
+                if (!$date->isSunday()) {
+                    $workingDays[] = $date->toDateString();
+                }
+                if ($date->isSaturday()) {
+                    $saturdaysCount++;
+                }
+            }
+    
+            $absentDays = array_diff($workingDays, $presentDays);
+    
+            $expectedStartTime = "08:00:00";
+            $lateCheckIns = $attendanceRecords->filter(function ($attendance) use ($expectedStartTime) {
+                $checkIn = Carbon::parse($attendance->check_in_time);
+                return $checkIn->format('H:i:s') > $expectedStartTime;
+            })->count();
+    
+            $totalOvertime = 0;
+            foreach ($attendanceRecords as $attendance) {
+                if ($attendance->check_out_time) {
+                    $hoursWorked = Carbon::parse($attendance->check_in_time)
+                        ->diffInHours(Carbon::parse($attendance->check_out_time));
+                    if ($hoursWorked > 8) {
+                        $totalOvertime += $hoursWorked - 8;
+                    }
+                }
+            }
+    
+            return response()->json([
+                'total_present' => count($presentDays),
+                'total_absent' => count($absentDays),
+                'absent_days' => array_values($absentDays),
+                'total_late' => $lateCheckIns,
+                'total_overtime' => $totalOvertime,
+                'saturdays_count' => $saturdaysCount,
+            ]);
+    
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+    
+    
     public function Display()
     {
         return view('Attendance');
@@ -641,7 +818,7 @@ public function add(Request $request)
 
     public function Submit(Request $data)
     {
-        // Validate incoming request
+        // Validate input
         $validated = $data->validate([
             'employee_id' => 'required|integer',
             'attendancestatus' => 'required|in:timein,timeout',
@@ -650,68 +827,106 @@ public function add(Request $request)
     
         $employeeId = $validated['employee_id'];
         $attendanceStatus = $validated['attendancestatus'];
+        $checkInTime = Carbon::parse($validated['check_in_time']); // Submitted check-in/check-out time
     
-        // Check if employee exists
+        // Fetch employee and schedule
         $employee = Employee::with('schedule')->find($employeeId);
         if (!$employee) {
             return back()->with('error', 'Employee not found!');
         }
     
-        // Check if the employee has a schedule
-        if (!$employee->schedule) {
-            return back()->with('error', 'Attendance not allowed: Employee has no assigned schedule!');
+        $schedule = $employee->schedule;
+        if (!$schedule) {
+            return back()->with('error', 'No schedule assigned for this employee!');
         }
     
-        // Adjust check-in time based on the 15-minute rule
-        $checkInTime = Carbon::parse($validated['check_in_time']);
-        $minute = $checkInTime->minute;
+        // Schedule details
+        $rawCheckInTime = $schedule->check_in_time; // Scheduled start
+        $rawCheckOutTime = $schedule->check_out_time; // Scheduled end
     
-        if ($minute >= 45 || $minute <= 15) {
-            // Round to the nearest hour
-            $adjustedTime = $minute >= 45
-                ? $checkInTime->copy()->ceilHour()
-                : $checkInTime->copy()->floorHour();
-        } else {
-            // Keep the exact time if between 16 and 44 minutes
-            $adjustedTime = $checkInTime;
+        // Determine schedule start and end times
+        $scheduleStart = Carbon::parse($rawCheckInTime)->setDate($checkInTime->year, $checkInTime->month, $checkInTime->day);
+        $scheduleEnd = Carbon::parse($rawCheckOutTime)->setDate($checkInTime->year, $checkInTime->month, $checkInTime->day);
+    
+        // If it's an overnight shift, adjust check-out time to the next day
+        if ($scheduleEnd <= $scheduleStart) {
+            $scheduleEnd->addDay();
         }
     
-        // Check for a holiday on the current date
-        $holiday = Holiday::whereDate('holiday_date', $adjustedTime->toDateString())->first();
-        $holidayId = $holiday ? $holiday->holiday_id : null;
+        // Restrict attendance earlier than 1 hour before schedule
+        $earliestAllowedCheckIn = $scheduleStart->copy()->subHour(); // 1 hour before schedule start
     
-        // Check if attendance already exists for the employee on the same day
-        $attendance = Attendance::where('employee_id', $employeeId)
-            ->whereDate('check_in_time', $adjustedTime->toDateString())
-            ->first();
+        // Restrict attendance past the schedule end time
+        if ($checkInTime->lt($earliestAllowedCheckIn)) {
+            return back()->with('error', 'Attendance denied: You cannot check in more than 1 hour before your scheduled time.');
+        }
     
-        if ($attendance) {
-            // Handle Time Out scenario
-            if ($attendanceStatus === 'timeout') {
-                $attendance->update([
-                    'check_out_time' => now()->toTimeString(),
-                ]);
-                return back()->with('success', 'Time Out recorded successfully!');
-            } else {
-                // Time In already exists
-                return back()->with('error', 'Time In already exists for this employee on this date!');
+        if ($checkInTime->gt($scheduleEnd)) {
+            return back()->with('error', 'Attendance denied: You cannot check in after your scheduled check-out time.');
+        }
+    
+        if ($attendanceStatus === 'timein') {
+            // Debugging logs
+            Log::info("Check-in Time: {$checkInTime}");
+            Log::info("Schedule Start: {$scheduleStart}, Earliest Allowed: {$earliestAllowedCheckIn}, Schedule End: {$scheduleEnd}");
+    
+            // Check if employee is late (10-minute threshold)
+            $lateThreshold = $scheduleStart->copy()->addMinutes(10);
+            $status = $checkInTime->greaterThan($lateThreshold) ? 'Late' : 'On-Time';
+    
+            // Prevent duplicate check-in
+            $attendance = Attendance::where('employee_id', $employeeId)
+                ->whereDate('check_in_time', $scheduleStart->toDateString())
+                ->first();
+    
+            if ($attendance) {
+                return back()->with('error', 'You already checked in for today!');
             }
-        } else {
-            // Handle Time In scenario
-            if ($attendanceStatus === 'timein') {
-                Attendance::create([
-                    'employee_id' => $employeeId,
-                    'check_in_time' => $adjustedTime,
-                    'check_out_time' => null,
-                    'holiday_id' => $holidayId, // Store holiday_id if it's a holiday
-                ]);
-                return back()->with('success', 'Time In recorded successfully!');
-            } else {
-                return back()->with('error', 'No Time In record found to Time Out!');
+    
+            // If the check-in time is within 10 minutes of the scheduled check-in time, round it
+            if ($checkInTime->diffInMinutes($scheduleStart) <= 10) {
+                $checkInTime = $scheduleStart->copy(); // Set to the scheduled check-in time if within 10 minutes
             }
+    
+            // Save check-in with status and schedule_id
+            Attendance::create([
+                'employee_id' => $employeeId,
+                'schedule_id' => $schedule->schedule_id, // Save the schedule_id
+                'check_in_time' => $checkInTime,
+                'check_out_time' => null,
+                'status' => $status,
+            ]);
+    
+            return back()->with('success', "Time In recorded successfully! Status: {$status}");
         }
+    
+        return back()->with('error', 'Invalid attendance status!');
+    
+        // Handle check-out
+        if ($attendanceStatus === 'timeout') {
+            // Find existing attendance record for today
+            $attendance = Attendance::where('employee_id', $employeeId)
+                ->whereDate('check_in_time', $checkInTime->toDateString())
+                ->first();
+    
+            if (!$attendance) {
+                return back()->with('error', 'Cannot check out without checking in first!');
+            }
+    
+            if ($attendance->check_out_time) {
+                return back()->with('error', 'You have already checked out for today!');
+            }
+    
+            // Save check-out time
+            $attendance->update([
+                'check_out_time' => $checkInTime,
+            ]);
+    
+            return back()->with('success', 'Time Out recorded successfully!');
+        }
+    
+        return back()->with('error', 'Invalid attendance status.');
     }
-    
 
     public function updateEmployee(Request $request, $id)
     {
@@ -828,47 +1043,41 @@ public function add(Request $request)
     
         return response()->json(['success' => true, 'message' => 'Position updated successfully!']);
     }
-    
+    public function saveAll(Request $request)
+{
+    // Get all employees
+    $employees = Employee::all();
 
-    public function assignPosition(Request $request)
-    {
-        $validatedData = $request->validate([
-            'employee_id' => 'required|exists:employees,employee_id',
-            'position' => 'required|exists:positions,position_id',
-        ]);
-
-        $employee = Employee::find($validatedData['employee_id']);
-
-        if ($employee->position_id != $validatedData['position']) {
-            $employee->position_id = $validatedData['position'];
-            $employee->save();
-
-            return redirect()->back()->with('success', 'Position updated successfully!');
-        } else {
-            return redirect()->back()->with('info', 'No changes were made, as the selected position is the same.');
-        }
+    // Loop through each employee and save payroll
+    foreach ($employees as $employee) {
+        $this->calculatePayroll($employee->employee_id, true);
     }
 
-    public function calculatePayroll($employee_id, $start_date = null, $end_date = null)
+    // Redirect back with a success message
+    return redirect()->back()->with('success', 'Payroll data saved successfully!');
+}
+
+    
+public function calculatePayroll($employee_id, $saveToDatabase = false, $startDate = null, $endDate = null)
 {
     $employee = Employee::with('position')->find($employee_id);
     if (!$employee || !$employee->position) {
         return null;
     }
-    
-        // Rate calculations
-        $regularRate = $employee->position->rate_per_hour;
-        $overtimeRate = $regularRate * 1.25;
-        $extra2to4AMRate = $regularRate * 1.1; // 10% extra for 2-4 AM
-    
-         // Rate calculations
+
+    // Rates
     $regularRate = $employee->position->rate_per_hour;
     $overtimeRate = $regularRate * 1.25;
-    $extra2to4AMRate = $regularRate * 1.1;
+    $extra2to4AMRate = ($regularRate * 0.1) + $overtimeRate;
 
-    // Use provided start and end dates; fallback to default weekly range
-    $endDate = $end_date ? Carbon::parse($end_date) : now();
-    $startDate = $start_date ? Carbon::parse($start_date) : $endDate->copy()->startOfWeek();
+    // Determine current 15-day period if no dates are passed
+    $today = Carbon::now();
+    $startDate = $startDate ?? ($today->day <= 15 
+                                 ? $today->copy()->startOfMonth() 
+                                 : $today->copy()->startOfMonth()->addDays(15));
+    $endDate = $endDate ?? ($today->day <= 15 
+                             ? $startDate->copy()->addDays(14) 
+                             : $startDate->copy()->endOfMonth());
 
     // Attendance data
     $attendances = Attendance::where('employee_id', $employee_id)
@@ -876,95 +1085,127 @@ public function add(Request $request)
         ->whereNotNull('check_in_time')
         ->whereNotNull('check_out_time')
         ->get();
-    
-        // Totals
-        $totalRegularPay = 0;
-        $totalOvertimePay = 0;
-        $totalHolidayPay = 0;
-        $total2to4AMPay = 0;
-    
-        foreach ($attendances as $attendance) {
-            $checkIn = Carbon::parse($attendance->check_in_time);
-            $checkOut = Carbon::parse($attendance->check_out_time);
-    
-            if ($checkOut->lessThan($checkIn)) {
-                $checkOut->addDay(); // Handle overnight shifts
+
+    // Totals
+    $totalRegularPay = 0;
+    $totalOvertimePay = 0;
+    $totalHolidayPay = 0;
+    $total2to4AMPay = 0;
+
+    foreach ($attendances as $attendance) {
+        $checkIn = Carbon::parse($attendance->check_in_time);
+        $checkOut = Carbon::parse($attendance->check_out_time);
+
+        if ($checkOut->lessThan($checkIn)) {
+            $checkOut->addDay(); // Handle overnight shifts
+        }
+
+        $hoursWorked = $checkIn->diffInHours($checkOut);
+
+        // Check for holiday
+        $holiday = Holiday::whereDate('holiday_date', $checkIn->toDateString())->first();
+        $isSunday = $checkIn->isSunday();
+
+        // Holiday bonus logic
+        $holidayBonus = 0;
+        if ($holiday) {
+            if ($holiday->type === 'regular') {
+                $holidayBonus = $regularRate; // Double pay for regular holiday
+            } elseif ($holiday->type === 'special') {
+                $holidayBonus = $regularRate * 0.3; // 30% extra for special holidays
             }
-    
-            $hoursWorked = $checkIn->diffInHours($checkOut);
-    
-            // Check for holiday
-            $holiday = Holiday::whereDate('holiday_date', $checkIn->toDateString())->first();
-            $isSunday = $checkIn->isSunday();
-    
-            // Holiday bonus logic
-            $holidayBonus = 0;
-            if ($holiday) {
-                if ($holiday->type === 'regular') {
-                    $holidayBonus = $regularRate; // Double pay for regular holiday
-                } elseif ($holiday->type === 'special') {
-                    $holidayBonus = $regularRate * 0.3; // 30% extra for special holidays
-                }
-            } elseif ($isSunday) {
-                $holidayBonus = $regularRate * 0.3; // Sunday bonus
-            }
-    
-            // Regular hours calculation (max 8 hours)
-            $regularHours = min(8, $hoursWorked);
-            $totalRegularPay += $regularHours * $regularRate;
-            $totalHolidayPay += $regularHours * $holidayBonus;
-    
-            // Overtime calculation (beyond 8 hours)
-            $overtimeHours = max(0, $hoursWorked - 8);
-            $totalOvertimePay += $overtimeHours * $overtimeRate;
-    
-            // 2-4 AM Pay Logic
-            $start2AM = $checkIn->copy()->setTime(2, 0, 0);
-            $end4AM = $checkIn->copy()->setTime(4, 0, 0);
-    
-            if ($checkIn->hour >= 18 || $checkIn->hour < 4) {
-                $start2AM = $checkIn->copy()->addDay()->setTime(2, 0, 0);
-                $end4AM = $checkIn->copy()->addDay()->setTime(4, 0, 0);
-            }
-    
-            // Calculate overlap between 2-4 AM and attendance time
-            if ($checkOut->greaterThan($start2AM) && $checkIn->lessThan($end4AM)) {
-                $overlapStart = $checkIn->greaterThan($start2AM) ? $checkIn : $start2AM;
-                $overlapEnd = $checkOut->lessThan($end4AM) ? $checkOut : $end4AM;
-    
-                if ($overlapStart->lessThan($overlapEnd)) {
-                    $overlapHours = $overlapStart->diffInMinutes($overlapEnd) / 60;
-                    $total2to4AMPay += $overlapHours * $extra2to4AMRate;
-                }
+        } elseif ($isSunday) {
+            $holidayBonus = $regularRate * 0.3; // Sunday bonus
+        }
+
+        // Regular hours calculation (max 8 hours)
+        $regularHours = min(8, $hoursWorked);
+        $totalRegularPay += $regularHours * $regularRate;
+        $totalHolidayPay += $regularHours * $holidayBonus;
+
+        // Overtime calculation (beyond 8 hours)
+        $overtimeHours = max(0, $hoursWorked - 8);
+
+        // 2-4 AM Pay Logic
+        $start2AM = $checkIn->copy()->setTime(2, 0, 0);
+        $end4AM = $checkIn->copy()->setTime(4, 0, 0);
+
+        if ($checkIn->hour >= 18 || $checkIn->hour < 4) {
+            $start2AM = $checkIn->copy()->addDay()->setTime(2, 0, 0);
+            $end4AM = $checkIn->copy()->addDay()->setTime(4, 0, 0);
+        }
+
+        // Calculate overlap between 2-4 AM and attendance time
+        $overlapHours = 0;
+        if ($checkOut->greaterThan($start2AM) && $checkIn->lessThan($end4AM)) {
+            $overlapStart = $checkIn->greaterThan($start2AM) ? $checkIn : $start2AM;
+            $overlapEnd = $checkOut->lessThan($end4AM) ? $checkOut : $end4AM;
+
+            if ($overlapStart->lessThan($overlapEnd)) {
+                $overlapHours = $overlapStart->diffInMinutes($overlapEnd) / 60;
+                $total2to4AMPay += $overlapHours * $extra2to4AMRate;
             }
         }
-    
-        // Gross salary calculation
-        $grossSalary = $totalRegularPay + $totalOvertimePay + $totalHolidayPay + $total2to4AMPay;
-    
-        // Fetch deductions
-        $deductions = $employee->deduction ? $employee->deduction->amount : 0;
-    
-        // Fetch and sum cash advances
-        $cashAdvanceTotal = CashAdvance::where('employee_id', $employee_id)
-            ->where('status', 'approved')
-            ->sum('amount');
-    
-        // Net salary calculation
-        $netSalary = $grossSalary - $deductions - $cashAdvanceTotal;
-    
-        // Return the detailed breakdown
-        return [
-            'regular_pay' => round($totalRegularPay, 2),
-            'overtime_pay' => round($totalOvertimePay, 2),
-            'holiday_pay' => round($totalHolidayPay, 2),
-            'extra_2to4_pay' => round($total2to4AMPay, 2),
-            'gross_salary' => round($grossSalary, 2),
-            'cash_advance' => round($cashAdvanceTotal, 2),
-            'net_salary' => round($netSalary, 2),
-            'start_date' => $startDate->toDateString(),
-            'end_date' => $endDate->toDateString(),
-        ];
+
+        // Adjust overtime hours if 2-4 AM overlap exists
+        if ($overlapHours > 0) {
+            $overtimeHours = max(0, $overtimeHours - $overlapHours);
+        }
+
+        $totalOvertimePay += $overtimeHours * $overtimeRate;
     }
-    
-}    
+
+    // Calculate gross salary
+    $grossSalary = $totalRegularPay + $totalOvertimePay + $totalHolidayPay + $total2to4AMPay;
+
+    // Check if deductions have already been applied this month
+    $currentMonth = $startDate->format('Y-m');
+    $existingPayrollWithDeductions = Payroll::where('employee_id', $employee_id)
+        ->where('start_date', 'LIKE', "$currentMonth%")
+        ->where('deductions', '>', 0)
+        ->exists();
+
+    // Apply deductions only if not already applied
+    $deductions = 0;
+    if (!$existingPayrollWithDeductions) {
+        $deductions = $employee->deduction ? $employee->deduction->amount : 0;
+    }
+
+    // Fetch and sum cash advances only for this payroll period
+    $cashAdvanceTotal = CashAdvance::where('employee_id', $employee_id)
+        ->whereBetween('request_date', [$startDate, $endDate])
+        ->where('status', 'approved')
+        ->sum('amount');
+
+    // Net salary calculation
+    $netSalary = $grossSalary - $deductions - $cashAdvanceTotal;
+
+    $payrollData = [
+        'employee_id'   => $employee_id,
+        'start_date'    => $startDate->toDateString(),
+        'end_date'      => $endDate->toDateString(),
+        'regular_pay'   => round($totalRegularPay, 2),
+        'overtime_pay'  => round($totalOvertimePay, 2),
+        'holiday_pay'   => round($totalHolidayPay, 2),
+        'extra_2to4_pay' => round($total2to4AMPay, 2),
+        'gross_salary'  => round($grossSalary, 2),
+        'cash_advance'  => round($cashAdvanceTotal, 2),
+        'deductions'    => round($deductions, 2),
+        'net_salary'    => round($netSalary, 2),
+    ];
+
+    // Save to database if requested
+    if ($saveToDatabase) {
+        Payroll::updateOrCreate(
+            [
+                'employee_id' => $employee_id,
+                'start_date'  => $startDate->toDateString(),
+                'end_date'    => $endDate->toDateString(),
+            ],
+            $payrollData
+        );
+    }
+
+    return $payrollData;
+}
+}
