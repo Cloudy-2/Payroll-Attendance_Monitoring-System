@@ -233,12 +233,14 @@ class Display extends Controller
     
         foreach ($attendancesToday as $attendance) {
             $schedule = optional($attendance->employee->schedule);
-    
-            if ($schedule && $attendance->check_in_time) {
+        
+            if ($schedule && $schedule->check_in_time && $attendance->check_in_time) {
                 $scheduledCheckIn = Carbon::parse($schedule->check_in_time)->setTimezone('Asia/Manila');
+                $gracePeriod = $scheduledCheckIn->addMinutes(10); // Add grace period
+                
                 $actualCheckIn = Carbon::parse($attendance->check_in_time)->setTimezone('Asia/Manila');
-    
-                if ($actualCheckIn->lte($scheduledCheckIn)) {
+        
+                if ($actualCheckIn->lte($gracePeriod)) {
                     $onTimeToday++;
                 } else {
                     $lateToday++;
@@ -835,10 +837,11 @@ public function add(Request $request)
             return back()->with('error', 'Employee not found!');
         }
     
-        $schedule = $employee->schedule;
-        if (!$schedule) {
+        if (!$employee->schedule) {
             return back()->with('error', 'No schedule assigned for this employee!');
         }
+    
+        $schedule = $employee->schedule;
     
         // Schedule details
         $rawCheckInTime = $schedule->check_in_time; // Scheduled start
@@ -883,15 +886,10 @@ public function add(Request $request)
                 return back()->with('error', 'You already checked in for today!');
             }
     
-            // If the check-in time is within 10 minutes of the scheduled check-in time, round it
-            if ($checkInTime->diffInMinutes($scheduleStart) <= 10) {
-                $checkInTime = $scheduleStart->copy(); // Set to the scheduled check-in time if within 10 minutes
-            }
-    
             // Save check-in with status and schedule_id
             Attendance::create([
                 'employee_id' => $employeeId,
-                'schedule_id' => $schedule->schedule_id, // Save the schedule_id
+                'schedule_id' => $schedule->id, // Save the schedule ID
                 'check_in_time' => $checkInTime,
                 'check_out_time' => null,
                 'status' => $status,
@@ -899,8 +897,6 @@ public function add(Request $request)
     
             return back()->with('success', "Time In recorded successfully! Status: {$status}");
         }
-    
-        return back()->with('error', 'Invalid attendance status!');
     
         // Handle check-out
         if ($attendanceStatus === 'timeout') {
@@ -927,6 +923,7 @@ public function add(Request $request)
     
         return back()->with('error', 'Invalid attendance status.');
     }
+    
 
     public function updateEmployee(Request $request, $id)
     {
